@@ -58,6 +58,33 @@ class FileTransferServerState {
   FileTransferServerState({required this.enabled, this.error, this.rootDir});
 }
 
+class PeerRefreshState {
+  const PeerRefreshState({
+    this.isLoading = false,
+    this.error = '',
+    this.updatedAt,
+  });
+
+  final bool isLoading;
+  final String error;
+  final DateTime? updatedAt;
+
+  bool get hasError => error.isNotEmpty;
+
+  PeerRefreshState copyWith({
+    bool? isLoading,
+    String? error,
+    DateTime? updatedAt,
+    bool clearUpdatedAt = false,
+  }) {
+    return PeerRefreshState(
+      isLoading: isLoading ?? this.isLoading,
+      error: error ?? this.error,
+      updatedAt: clearUpdatedAt ? null : (updatedAt ?? this.updatedAt),
+    );
+  }
+}
+
 class FungiController extends GetxController {
   FungiDaemonClient fungiClient;
   late final DaemonServiceManager daemonManager;
@@ -88,6 +115,7 @@ class FungiController extends GetxController {
   final localServices = <LocalServiceView>[].obs;
   final peerCatalogServices = <String, List<RemoteServiceListEntryView>>{}.obs;
   final peerConnections = <String, List<ConnectionSnapshot>>{}.obs;
+  final peerRefreshStates = <String, PeerRefreshState>{}.obs;
 
   final localServicesLoading = false.obs;
   final availableServicesLoading = false.obs;
@@ -327,6 +355,7 @@ class FungiController extends GetxController {
 
   Future<void> updateAddressBook() async {
     addressBook.value = (await fungiClient.listAddressBookPeers(Empty())).peers;
+    _retainPeerScopedState(addressBook.map((peer) => peer.peerId).toSet());
   }
 
   Future<void> addIncomingAllowedPeer(PeerInfo peerInfo) async {
@@ -365,6 +394,10 @@ class FungiController extends GetxController {
       RemoveAddressBookPeerRequest()..peerId = peerId,
     );
     await updateAddressBook();
+  }
+
+  Future<void> refreshSinglePeerServices(String peerId) async {
+    await refreshPeerCatalogForPeers(<String>[peerId]);
   }
 
   Future<void> startFileTransferServer(String rootDir) async {
@@ -758,61 +791,9 @@ class FungiController extends GetxController {
     availableServicesError.value = '';
 
     try {
-      final accessResponse = await fungiClient.listServiceAccesses(
-        ListServiceAccessesRequest(),
+      await refreshPeerCatalogForPeers(
+        addressBook.map((peer) => peer.peerId).toList(growable: false),
       );
-      final attachedAccesses = decodeJsonStringList(
-        accessResponse.serviceAccessesJson,
-        (json) => json,
-      );
-      final accessByService = <String, Map<String, dynamic>>{};
-      for (final access in attachedAccesses) {
-        final peerId = access['peer_id'] as String? ?? '';
-        final serviceId = access['service_id'] as String? ?? '';
-        if (peerId.isEmpty || serviceId.isEmpty) {
-          continue;
-        }
-        accessByService['$peerId::$serviceId'] = access;
-      }
-
-      final next = <String, List<RemoteServiceListEntryView>>{};
-      for (final peer in addressBook) {
-        try {
-          final catalogResponse = await fungiClient.listPeerCatalog(
-            ListPeerCatalogRequest()..peerId = peer.peerId,
-          );
-          final services = decodeJsonStringList(catalogResponse.servicesJson, (
-            serviceJson,
-          ) {
-            final serviceId = serviceJson['service_id'] as String? ?? '';
-            final access = accessByService['${peer.peerId}::$serviceId'];
-
-            return RemoteServiceListEntryView.fromJson({
-              'display_name': serviceJson['display_name'],
-              'service_name': serviceJson['service_name'],
-              'runtime': serviceJson['runtime']?.toString(),
-              'transport': serviceJson['transport'],
-              'usage': serviceJson['usage'],
-              'state':
-                  (serviceJson['status'] as Map<String, dynamic>?)?['state'],
-              'running':
-                  (serviceJson['status'] as Map<String, dynamic>?)?['running'],
-              'published': true,
-              'service_id': serviceId,
-              'access_attached': access != null,
-              'catalog_id': serviceJson['catalog_id'],
-              'icon_url': serviceJson['icon_url'],
-              'published_endpoints': serviceJson['endpoints'] ?? const [],
-              'local_access_endpoints': access?['endpoints'] ?? const [],
-            });
-          });
-          next[peer.peerId] = services;
-        } catch (e) {
-          debugPrint('Failed to load peer catalog for ${peer.peerId}: $e');
-          next[peer.peerId] = const [];
-        }
-      }
-      peerCatalogServices.value = next;
     } catch (e) {
       availableServicesError.value = 'Failed to load available services: $e';
       debugPrint(availableServicesError.value);
@@ -834,11 +815,91 @@ class FungiController extends GetxController {
         grouped.putIfAbsent(connection.peerId, () => []).add(connection);
       }
       peerConnections.value = grouped;
-      await refreshAvailableServicesData();
+      await refreshPeerCatalogForPeers(
+        addressBook.map((peer) => peer.peerId).toList(growable: false),
+      );
     } catch (e) {
       debugPrint('Failed to refresh node management data: $e');
     } finally {
       nodeManagementLoading.value = false;
+    }
+  }
+
+  Future<void> refreshPeerCatalogForPeers(List<String> peerIds) async {
+    final accessResponse = await fungiClient.listServiceAccesses(
+      ListServiceAccessesRequest(),
+    );
+    final attachedAccesses = decodeJsonStringList(
+      accessResponse.serviceAccessesJson,
+      (json) => json,
+    );
+    final accessByService = <String, Map<String, dynamic>>{};
+    for (final access in attachedAccesses) {
+      final peerId = access['peer_id'] as String? ?? '';
+      final serviceId = access['service_id'] as String? ?? '';
+      if (peerId.isEmpty || serviceId.isEmpty) {
+        continue;
+      }
+      accessByService['$peerId::$serviceId'] = access;
+    }
+
+    for (final peerId in peerIds) {
+      _setPeerRefreshState(
+        peerId,
+        peerRefreshStateFor(peerId).copyWith(isLoading: true, error: ''),
+      );
+
+      try {
+        final catalogResponse = await fungiClient.listPeerCatalog(
+          ListPeerCatalogRequest()..peerId = peerId,
+        );
+        final services = decodeJsonStringList(catalogResponse.servicesJson, (
+          serviceJson,
+        ) {
+          final serviceId = serviceJson['service_id'] as String? ?? '';
+          final access = accessByService['$peerId::$serviceId'];
+
+          return RemoteServiceListEntryView.fromJson({
+            'display_name': serviceJson['display_name'],
+            'service_name': serviceJson['service_name'],
+            'runtime': serviceJson['runtime']?.toString(),
+            'transport': serviceJson['transport'],
+            'usage': serviceJson['usage'],
+            'state':
+                (serviceJson['status'] as Map<String, dynamic>?)?['state'],
+            'running':
+                (serviceJson['status'] as Map<String, dynamic>?)?['running'],
+            'published': true,
+            'service_id': serviceId,
+            'access_attached': access != null,
+            'catalog_id': serviceJson['catalog_id'],
+            'icon_url': serviceJson['icon_url'],
+            'published_endpoints': serviceJson['endpoints'] ?? const [],
+            'local_access_endpoints': access?['endpoints'] ?? const [],
+          });
+        });
+        final next = Map<String, List<RemoteServiceListEntryView>>.from(
+          peerCatalogServices,
+        )..[peerId] = services;
+        peerCatalogServices.value = next;
+        _setPeerRefreshState(
+          peerId,
+          PeerRefreshState(
+            isLoading: false,
+            error: '',
+            updatedAt: DateTime.now(),
+          ),
+        );
+      } catch (e) {
+        debugPrint('Failed to load peer catalog for $peerId: $e');
+        _setPeerRefreshState(
+          peerId,
+          peerRefreshStateFor(peerId).copyWith(
+            isLoading: false,
+            error: e.toString(),
+          ),
+        );
+      }
     }
   }
 
@@ -983,6 +1044,42 @@ class FungiController extends GetxController {
       break;
     }
     return peerId;
+  }
+
+  PeerRefreshState peerRefreshStateFor(String peerId) {
+    return peerRefreshStates[peerId] ?? const PeerRefreshState();
+  }
+
+  void _setPeerRefreshState(String peerId, PeerRefreshState state) {
+    final next = Map<String, PeerRefreshState>.from(peerRefreshStates)
+      ..[peerId] = state;
+    peerRefreshStates.value = next;
+  }
+
+  void _retainPeerScopedState(Set<String> peerIds) {
+    final nextConnections = <String, List<ConnectionSnapshot>>{};
+    for (final entry in peerConnections.entries) {
+      if (peerIds.contains(entry.key)) {
+        nextConnections[entry.key] = entry.value;
+      }
+    }
+    peerConnections.value = nextConnections;
+
+    final nextCatalogServices = <String, List<RemoteServiceListEntryView>>{};
+    for (final entry in peerCatalogServices.entries) {
+      if (peerIds.contains(entry.key)) {
+        nextCatalogServices[entry.key] = entry.value;
+      }
+    }
+    peerCatalogServices.value = nextCatalogServices;
+
+    final nextRefreshStates = <String, PeerRefreshState>{};
+    for (final entry in peerRefreshStates.entries) {
+      if (peerIds.contains(entry.key)) {
+        nextRefreshStates[entry.key] = entry.value;
+      }
+    }
+    peerRefreshStates.value = nextRefreshStates;
   }
 
   List<ConnectionSnapshot> connectionsForPeer(String peerId) {

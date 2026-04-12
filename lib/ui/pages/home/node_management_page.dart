@@ -5,16 +5,38 @@ import 'package:fungi_app/ui/widgets/enhanced_card.dart';
 import 'package:fungi_app/ui/widgets/text.dart';
 import 'package:get/get.dart';
 
-class NodeManagementPage extends GetView<FungiController> {
+class NodeManagementPage extends StatefulWidget {
   const NodeManagementPage({super.key});
 
   @override
+  State<NodeManagementPage> createState() => _NodeManagementPageState();
+}
+
+class _NodeManagementPageState extends State<NodeManagementPage>
+    with AutomaticKeepAliveClientMixin {
+  final controller = Get.find<FungiController>();
+  final _scrollController = ScrollController();
+  final _expandedPeerIds = <String>{};
+
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    super.build(context);
+
     return Obx(() {
       final peers = controller.addressBook;
       return RefreshIndicator(
         onRefresh: controller.refreshNodeManagementData,
         child: ListView(
+          controller: _scrollController,
           padding: const EdgeInsets.all(16),
           children: [
             Row(
@@ -24,7 +46,7 @@ class NodeManagementPage extends GetView<FungiController> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Node Management',
+                        'Peers',
                         style: Theme.of(context).textTheme.headlineSmall,
                       ),
                       const SizedBox(height: 6),
@@ -32,6 +54,14 @@ class NodeManagementPage extends GetView<FungiController> {
                         'Known peers from the address book, plus connection state and published catalog services.',
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
+                      if (controller.nodeManagementLoading.value)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text(
+                            'Refreshing peers… cards will update as each peer finishes.',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ),
                     ],
                   ),
                 ),
@@ -44,20 +74,28 @@ class NodeManagementPage extends GetView<FungiController> {
               ],
             ),
             const SizedBox(height: 16),
-            if (controller.nodeManagementLoading.value)
-              const Center(
-                child: Padding(
-                  padding: EdgeInsets.symmetric(vertical: 32),
-                  child: CircularProgressIndicator(),
-                ),
-              )
-            else if (peers.isEmpty)
+            if (peers.isEmpty)
               Text(
-                'No known nodes yet.',
+                'No known peers yet.',
                 style: Theme.of(context).textTheme.bodyMedium,
               )
             else
-              ...peers.map((peer) => _PeerCard(peer: peer)),
+              ...peers.map(
+                (peer) => _PeerCard(
+                  key: ValueKey(peer.peerId),
+                  peer: peer,
+                  expanded: _expandedPeerIds.contains(peer.peerId),
+                  onExpansionChanged: (expanded) {
+                    setState(() {
+                      if (expanded) {
+                        _expandedPeerIds.add(peer.peerId);
+                      } else {
+                        _expandedPeerIds.remove(peer.peerId);
+                      }
+                    });
+                  },
+                ),
+              ),
           ],
         ),
       );
@@ -66,15 +104,23 @@ class NodeManagementPage extends GetView<FungiController> {
 }
 
 class _PeerCard extends GetView<FungiController> {
-  const _PeerCard({required this.peer});
+  const _PeerCard({
+    super.key,
+    required this.peer,
+    required this.expanded,
+    required this.onExpansionChanged,
+  });
 
   final PeerInfo peer;
+  final bool expanded;
+  final ValueChanged<bool> onExpansionChanged;
 
   @override
   Widget build(BuildContext context) {
     final connections = controller.connectionsForPeer(peer.peerId);
     final catalogServices = controller.servicesForPeer(peer.peerId);
     final latency = controller.bestLatencyForPeer(peer.peerId);
+    final refreshState = controller.peerRefreshStateFor(peer.peerId);
     final title = peer.alias.isNotEmpty
         ? peer.alias
         : (peer.hostname.isNotEmpty ? peer.hostname : peer.peerId);
@@ -83,6 +129,28 @@ class _PeerCard extends GetView<FungiController> {
       padding: const EdgeInsets.only(bottom: 12),
       child: EnhancedCard(
         child: ExpansionTile(
+          key: PageStorageKey('peer-${peer.peerId}'),
+          initiallyExpanded: expanded,
+          onExpansionChanged: onExpansionChanged,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (refreshState.isLoading)
+                const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              IconButton(
+                tooltip: 'Refresh peer',
+                onPressed: refreshState.isLoading
+                    ? null
+                    : () => controller.refreshSinglePeerServices(peer.peerId),
+                icon: const Icon(Icons.refresh, size: 20),
+              ),
+              Icon(expanded ? Icons.expand_less : Icons.expand_more),
+            ],
+          ),
           title: Text(title),
           subtitle: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -102,6 +170,8 @@ class _PeerCard extends GetView<FungiController> {
                   if (latency != null) Chip(label: Text('$latency ms')),
                 ],
               ),
+              const SizedBox(height: 6),
+              _PeerRefreshStatus(peerId: peer.peerId),
             ],
           ),
           childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
@@ -171,13 +241,28 @@ class _PeerCard extends GetView<FungiController> {
                 ),
               ),
             ],
-            if (catalogServices.isNotEmpty) ...[
-              const SizedBox(height: 12),
+            const SizedBox(height: 12),
+            Text(
+              'Published Services',
+              style: Theme.of(context).textTheme.titleSmall,
+            ),
+            const SizedBox(height: 8),
+            if (refreshState.isLoading && catalogServices.isEmpty)
               Text(
-                'Published Services',
-                style: Theme.of(context).textTheme.titleSmall,
-              ),
-              const SizedBox(height: 8),
+                'Refreshing published services…',
+                style: Theme.of(context).textTheme.bodySmall,
+              )
+            else if (refreshState.hasError && catalogServices.isEmpty)
+              Text(
+                refreshState.error,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              )
+            else if (catalogServices.isEmpty)
+              Text(
+                'No published services found.',
+                style: Theme.of(context).textTheme.bodySmall,
+              )
+            else
               ...catalogServices.map(
                 (service) => Padding(
                   padding: const EdgeInsets.only(bottom: 8),
@@ -205,10 +290,63 @@ class _PeerCard extends GetView<FungiController> {
                   ),
                 ),
               ),
-            ],
           ],
         ),
       ),
     );
+  }
+}
+
+class _PeerRefreshStatus extends GetView<FungiController> {
+  const _PeerRefreshStatus({required this.peerId});
+
+  final String peerId;
+
+  @override
+  Widget build(BuildContext context) {
+    final state = controller.peerRefreshStateFor(peerId);
+    final theme = Theme.of(context);
+
+    if (state.hasError) {
+      return Text(
+        'Last refresh failed: ${state.error}',
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.error,
+        ),
+      );
+    }
+
+    if (state.isLoading) {
+      return Text(
+        'Refreshing…',
+        style: theme.textTheme.bodySmall,
+      );
+    }
+
+    if (state.updatedAt != null) {
+      return Text(
+        'Updated ${_formatRelativeTime(state.updatedAt!)}',
+        style: theme.textTheme.bodySmall,
+      );
+    }
+
+    return Text(
+      'Not refreshed yet.',
+      style: theme.textTheme.bodySmall,
+    );
+  }
+
+  String _formatRelativeTime(DateTime updatedAt) {
+    final diff = DateTime.now().difference(updatedAt);
+    if (diff.inSeconds < 30) {
+      return 'just now';
+    }
+    if (diff.inMinutes < 60) {
+      return '${diff.inMinutes}m ago';
+    }
+    if (diff.inHours < 24) {
+      return '${diff.inHours}h ago';
+    }
+    return '${diff.inDays}d ago';
   }
 }
