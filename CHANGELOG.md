@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.8.0+5] - Unreleased
+
+### Added
+
+- Optional start after applying a service, with final running-state verification.
+
+### Changed
+
+- Bundle Fungi core 0.8.0 and support the 0.8.x daemon API line.
+- Show structured apply outcomes, including unchanged definitions and partially completed updates.
+
+### Removed
+
+- Advanced tab and obsolete managed Docker runtime UI.
+
 ## [0.7.1+4] - 2026-08-29
 
 ### Changed

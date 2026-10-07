@@ -1,0 +1,197 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fungi_app/app/controllers/fungi_controller.dart';
+import 'package:fungi_app/app/models/service_apply_result.dart';
+import 'package:fungi_app/src/grpc/generated/fungi_daemon.pb.dart';
+import 'package:fungi_app/ui/widgets/create_service_dialog.dart';
+import 'package:get/get.dart';
+import 'package:get_storage/get_storage.dart';
+
+class DialogController extends FungiController {
+  int applyCount = 0;
+  bool? requestedStart;
+  String? requestedName;
+  String? requestedPeer;
+  Completer<ServiceApplyResult>? pendingApply;
+  ServiceApplyResult result = const ServiceApplyResult(
+    disposition: ServiceApplyDisposition.complete,
+  );
+
+  @override
+  // Keep this UI test independent of daemon and desktop plugin startup.
+  // ignore: must_call_super
+  void onInit() {}
+
+  @override
+  Future<List<RecipeSummary>> listServiceRecipes({bool refresh = false}) async {
+    return [RecipeSummary(id: 'filebrowser', name: 'File Browser')];
+  }
+
+  @override
+  Future<RecipeDetail> getServiceRecipeDetail({
+    required String recipeId,
+    bool refresh = false,
+  }) async => RecipeDetail(
+    summary: RecipeSummary(id: recipeId, name: 'File Browser'),
+  );
+
+  @override
+  Future<ResolveRecipeResponse> resolveServiceRecipe({
+    required String recipeId,
+    String? serviceName,
+    String? peerId,
+    bool refresh = false,
+  }) async {
+    requestedName = serviceName;
+    requestedPeer = peerId;
+    return ResolveRecipeResponse(manifestYaml: 'resolved service');
+  }
+
+  @override
+  Future<ServiceApplyResult> createLocalServiceFromResolvedRecipe(
+    ResolveRecipeResponse resolved, {
+    bool startAfterApply = false,
+  }) async {
+    applyCount++;
+    requestedStart = startAfterApply;
+    return pendingApply == null ? result : await pendingApply!.future;
+  }
+
+  @override
+  Future<ServiceApplyResult> createRemoteServiceFromResolvedRecipe({
+    required String peerId,
+    required ResolveRecipeResponse resolved,
+    bool startAfterApply = false,
+  }) async {
+    requestedPeer = peerId;
+    return createLocalServiceFromResolvedRecipe(
+      resolved,
+      startAfterApply: startAfterApply,
+    );
+  }
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  late Directory storageDirectory;
+  setUpAll(() async {
+    storageDirectory = await Directory.systemTemp.createTemp(
+      'fungi-dialog-test-',
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('plugins.flutter.io/path_provider'),
+          (_) async => storageDirectory.path,
+        );
+    await File('${storageDirectory.path}/GetStorage.gs').writeAsString('{}');
+    await GetStorage('GetStorage', storageDirectory.path).initStorage;
+  });
+  tearDownAll(() => storageDirectory.delete(recursive: true));
+  late DialogController controller;
+  setUp(() {
+    Get.testMode = true;
+    controller = DialogController();
+    Get.put<FungiController>(controller);
+  });
+  tearDown(() => Get.reset());
+
+  Future<void> openDialog(WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1200, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(
+      GetMaterialApp(
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => TextButton(
+              onPressed: () => showCreateServiceDialog(context),
+              child: const Text('Open'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Open'));
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets('optional startup and busy state prevent duplicate submissions', (
+    tester,
+  ) async {
+    controller.pendingApply = Completer<ServiceApplyResult>();
+    await openDialog(tester);
+    await tester.tap(find.widgetWithText(ChoiceChip, 'Recipe'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byType(CheckboxListTile));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Apply & Start'));
+    await tester.pump();
+    await tester.pump();
+    expect(controller.applyCount, 1);
+    expect(controller.requestedStart, isTrue);
+    final button = tester.widget<FilledButton>(find.byType(FilledButton));
+    expect(button.onPressed, isNull);
+    await tester.binding.handlePopRoute();
+    await tester.pump();
+    expect(find.text('Apply Service'), findsOneWidget);
+    controller.pendingApply!.complete(
+      const ServiceApplyResult(disposition: ServiceApplyDisposition.complete),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Apply Service'), findsNothing);
+  });
+
+  testWidgets('partial success keeps the dialog open with verified state', (
+    tester,
+  ) async {
+    controller.result = const ServiceApplyResult(
+      disposition: ServiceApplyDisposition.partial,
+      errorMessage: 'startup failed: module unavailable',
+      outcome: ServiceApplyOutcome(
+        manifestChange: 'created',
+        workloadAction: 'none',
+        finalPhase: 'stopped',
+      ),
+    );
+    await openDialog(tester);
+    await tester.tap(find.widgetWithText(ChoiceChip, 'Recipe'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Apply Here'));
+    await tester.pumpAndSettle();
+    expect(find.text('Apply Service'), findsOneWidget);
+    expect(find.textContaining('definition applied, but'), findsOneWidget);
+    expect(find.textContaining('Final state: stopped.'), findsOneWidget);
+    expect(
+      tester.widget<FilledButton>(find.byType(FilledButton)).onPressed,
+      isNotNull,
+    );
+  });
+
+  testWidgets('ordinary apply forwards the entered instance name and target', (
+    tester,
+  ) async {
+    final peer = DeviceInfo(peerId: 'peer-7', name: 'Desk');
+    controller.addressBook.add(peer);
+    await openDialog(tester);
+    await tester.tap(find.widgetWithText(ChoiceChip, 'Remote'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(ChoiceChip, 'Recipe'));
+    await tester.pumpAndSettle();
+    expect(tester.widget<TextField>(find.byType(TextField)).readOnly, isFalse);
+    await tester.enterText(find.byType(TextField), 'my-files');
+    for (final chip in tester.widgetList<ChoiceChip>(find.byType(ChoiceChip))) {
+      expect(chip.onSelected, isNotNull);
+    }
+    await tester.tap(find.widgetWithText(FilledButton, 'Apply to Device'));
+    await tester.pumpAndSettle();
+    expect(controller.requestedName, 'my-files');
+    expect(controller.requestedPeer, 'peer-7');
+    expect(controller.requestedStart, isFalse);
+    expect(controller.applyCount, 1);
+  });
+}
