@@ -120,6 +120,7 @@ class FungiController extends GetxController {
   static const documentationUrl = 'https://fungi.rs/docs/intro';
   static const daemonDisabledStorageKey = 'daemon_disabled';
   static const _recipeRequestTimeout = Duration(seconds: 20);
+  static const _serviceListRequestTimeout = Duration(seconds: 10);
   static const _deviceServiceSnapshotRequestTimeout = Duration(seconds: 10);
   static const _remotePeerServicesRequestTimeout = Duration(seconds: 8);
 
@@ -1159,7 +1160,10 @@ class FungiController extends GetxController {
     localServicesError.value = '';
 
     try {
-      final response = await fungiClient.listServices(Empty());
+      final response = await fungiClient.listServices(
+        Empty(),
+        options: grpc.CallOptions(timeout: _serviceListRequestTimeout),
+      );
       localServices.value = decodeJsonStringList(
         response.servicesJson,
         LocalServiceView.fromJson,
@@ -1183,6 +1187,7 @@ class FungiController extends GetxController {
     try {
       final accessResponse = await fungiClient.listServiceAccesses(
         ListServiceAccessesRequest()..peerId = peerId ?? '',
+        options: grpc.CallOptions(timeout: _serviceListRequestTimeout),
       );
       final attachedAccesses = decodeJsonStringList(
         accessResponse.serviceAccessesJson,
@@ -1710,17 +1715,20 @@ class FungiController extends GetxController {
       }
       return result;
     } finally {
-      // Refresh errors must not change the reported result of a completed RPC.
-      try {
-        if (peerId == null) {
-          await refreshLocalServicesData();
-        } else {
-          await _refreshRemoteDeviceFromCache(peerId);
-          _refreshRemoteDeviceInBackground(peerId);
-        }
-      } catch (error) {
-        debugPrint('Failed to refresh after service apply: $error');
+      unawaited(_refreshAfterServiceApply(peerId));
+    }
+  }
+
+  Future<void> _refreshAfterServiceApply(String? peerId) async {
+    try {
+      if (peerId == null) {
+        await refreshLocalServicesData();
+      } else {
+        await _refreshRemoteDeviceFromCache(peerId);
+        _refreshRemoteDeviceInBackground(peerId);
       }
+    } catch (error) {
+      debugPrint('Failed to refresh after service apply: $error');
     }
   }
 

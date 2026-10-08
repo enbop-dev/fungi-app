@@ -6,10 +6,13 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fungi_app/app/controllers/fungi_controller.dart';
 import 'package:fungi_app/app/models/service_apply_result.dart';
-import 'package:fungi_app/src/grpc/generated/fungi_daemon.pb.dart';
+import 'package:fungi_app/src/grpc/generated/fungi_daemon.pbgrpc.dart';
 import 'package:fungi_app/ui/widgets/create_service_dialog.dart';
 import 'package:get/get.dart';
 import 'package:get_storage/get_storage.dart';
+import 'package:grpc/grpc.dart';
+
+import 'service_apply_client_test.dart' show ApplyDaemon;
 
 // GetStorage keeps its file open and exposes no dispose method. Track that
 // handle so the fixture can close it before deleting its directory on Windows.
@@ -97,6 +100,70 @@ class DialogController extends FungiController {
   }
 }
 
+class BlockedRefreshDaemon extends ApplyDaemon {
+  final refreshEntered = Completer<void>();
+  final releaseRefresh = Completer<void>();
+  DateTime? refreshDeadline;
+  bool failApply = false;
+
+  @override
+  void checkApply(ServiceCall call) {
+    if (failApply) throw GrpcError.internal('apply rejected');
+    super.checkApply(call);
+  }
+
+  Future<void> waitForRefresh(ServiceCall call) async {
+    if (!refreshEntered.isCompleted) {
+      refreshDeadline = call.deadline;
+      refreshEntered.complete();
+    }
+    await releaseRefresh.future;
+    if (failApply) throw GrpcError.unavailable('list refresh failed');
+  }
+
+  @override
+  Future<ListServicesResponse> listServices(
+    ServiceCall call,
+    Empty request,
+  ) async {
+    await waitForRefresh(call);
+    return ListServicesResponse(servicesJson: '[${instance(phaseAfterApply)}]');
+  }
+
+  @override
+  Future<ServiceAccessesResponse> listServiceAccesses(
+    ServiceCall call,
+    ListServiceAccessesRequest request,
+  ) async {
+    await waitForRefresh(call);
+    return ServiceAccessesResponse(serviceAccessesJson: '[]');
+  }
+}
+
+class RefreshTrackingController extends FungiController {
+  final refreshFinished = Completer<void>();
+
+  @override
+  Future<void> refreshLocalServicesData() async {
+    await super.refreshLocalServicesData();
+    refreshFinished.complete();
+  }
+
+  @override
+  Future<void> refreshAvailableServicesData({
+    String? peerId,
+    bool cached = false,
+    bool showLoading = true,
+  }) async {
+    await super.refreshAvailableServicesData(
+      peerId: peerId,
+      cached: cached,
+      showLoading: showLoading,
+    );
+    if (!cached) refreshFinished.complete();
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   late Directory storageDirectory;
@@ -137,6 +204,85 @@ void main() {
     Get.put<FungiController>(controller);
   });
   tearDown(() => Get.reset());
+
+  for (final remote in [false, true]) {
+    for (final failed in [false, true]) {
+      test(
+        '${remote ? 'remote' : 'local'} ${failed ? 'failed' : 'partial'} apply returns while refresh is pending',
+        () async {
+          final daemon = BlockedRefreshDaemon()
+            ..partialApply = !failed
+            ..failApply = failed;
+          final server = Server.create(services: [daemon]);
+          await server.serve(address: '127.0.0.1', port: 0);
+          final channel = ClientChannel(
+            '127.0.0.1',
+            port: server.port!,
+            options: const ChannelOptions(
+              credentials: ChannelCredentials.insecure(),
+            ),
+          );
+          final applyController = RefreshTrackingController()
+            ..fungiClient = FungiDaemonClient(channel)
+            ..addressBook.add(DeviceInfo(peerId: 'peer-7'));
+          final resolved = ResolveRecipeResponse(manifestYaml: 'manifest');
+          final resultFuture = remote
+              ? applyController.createRemoteServiceFromResolvedRecipe(
+                  peerId: 'peer-7',
+                  resolved: resolved,
+                )
+              : applyController.createLocalServiceFromResolvedRecipe(resolved);
+          try {
+            await daemon.refreshEntered.future.timeout(
+              const Duration(seconds: 5),
+            );
+            final result = await resultFuture.timeout(
+              const Duration(seconds: 2),
+            );
+            expect(
+              result.disposition,
+              failed
+                  ? ServiceApplyDisposition.failed
+                  : ServiceApplyDisposition.partial,
+            );
+            expect(
+              result.message,
+              contains(failed ? 'apply rejected' : 'Address already in use'),
+            );
+            expect(daemon.refreshDeadline, isNotNull);
+            expect(applyController.refreshFinished.isCompleted, isFalse);
+          } finally {
+            daemon.releaseRefresh.complete();
+            try {
+              await resultFuture;
+              await applyController.refreshFinished.future.timeout(
+                const Duration(seconds: 5),
+              );
+              if (!remote) {
+                expect(applyController.localServicesLoading.value, isFalse);
+                if (failed) {
+                  expect(
+                    applyController.localServicesError.value,
+                    contains('list refresh failed'),
+                  );
+                } else {
+                  expect(applyController.localServices.single.name, 'files');
+                }
+              } else if (!failed) {
+                expect(
+                  applyController.peerRemoteServices['peer-7'],
+                  hasLength(1),
+                );
+              }
+            } finally {
+              await channel.shutdown();
+              await server.shutdown();
+            }
+          }
+        },
+      );
+    }
+  }
 
   Future<void> openDialog(WidgetTester tester) async {
     tester.view.physicalSize = const Size(1200, 1000);
