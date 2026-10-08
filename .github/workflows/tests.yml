@@ -52,7 +52,13 @@ jobs:
       - name: Install Windows Dependencies
         if: matrix.target == 'windows'
         run: |
-          choco install protoc
+          $protocArchive = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+          $protocDirectory = Join-Path $env:RUNNER_TEMP 'protoc'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip' -OutFile $protocArchive
+          Expand-Archive -Path $protocArchive -DestinationPath $protocDirectory
+          $protocBin = Join-Path $protocDirectory 'bin'
+          $protocBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $protocBin 'protoc.exe') --version
         shell: powershell
 
       - name: Setup Flutter
