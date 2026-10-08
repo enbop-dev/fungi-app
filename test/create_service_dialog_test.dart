@@ -11,6 +11,28 @@ import 'package:fungi_app/ui/widgets/create_service_dialog.dart';
 import 'package:get/get.dart';
 import 'package:get_storage/get_storage.dart';
 
+// GetStorage keeps its file open and exposes no dispose method. Track that
+// handle so the fixture can close it before deleting its directory on Windows.
+class _StorageFile implements File {
+  _StorageFile(this.file, this.onOpen);
+
+  final File file;
+  final void Function(RandomAccessFile) onOpen;
+
+  @override
+  bool existsSync() => file.existsSync();
+
+  @override
+  Future<RandomAccessFile> open({FileMode mode = FileMode.read}) async {
+    final handle = await file.open(mode: mode);
+    onOpen(handle);
+    return handle;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
 class DialogController extends FungiController {
   int applyCount = 0;
   bool? requestedStart;
@@ -78,6 +100,7 @@ class DialogController extends FungiController {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   late Directory storageDirectory;
+  final storageHandles = <RandomAccessFile>[];
   setUpAll(() async {
     storageDirectory = await Directory.systemTemp.createTemp(
       'fungi-dialog-test-',
@@ -87,10 +110,26 @@ void main() {
           const MethodChannel('plugins.flutter.io/path_provider'),
           (_) async => storageDirectory.path,
         );
-    await File('${storageDirectory.path}/GetStorage.gs').writeAsString('{}');
-    await GetStorage('GetStorage', storageDirectory.path).initStorage;
+    final storageFile = File(
+      '${storageDirectory.path}${Platform.pathSeparator}GetStorage.gs',
+    );
+    await storageFile.writeAsString('{}');
+    await IOOverrides.runZoned(
+      () => GetStorage('GetStorage', storageDirectory.path).initStorage,
+      createFile: (path) {
+        if (path != storageFile.path) {
+          throw StateError('Unexpected storage file: $path');
+        }
+        return _StorageFile(storageFile, storageHandles.add);
+      },
+    );
   });
-  tearDownAll(() => storageDirectory.delete(recursive: true));
+  tearDownAll(() async {
+    for (final handle in storageHandles) {
+      await handle.close();
+    }
+    await storageDirectory.delete(recursive: true);
+  });
   late DialogController controller;
   setUp(() {
     Get.testMode = true;
