@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## [0.8.0+5] - Unreleased
+## [0.8.0+5] - 2026-10-08
 
 ### Added
 
@@ -12,6 +12,10 @@ All notable changes to this project are documented in this file.
 
 - Bundle Fungi core 0.8.0 and support the 0.8.x daemon API line.
 - Show structured apply outcomes, including unchanged definitions and partially completed updates.
+
+### Fixed
+
+- Return completed service apply results without waiting for list refreshes, and bound list requests with timeouts.
 
 ### Removed
 
